@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Nostr Demo Client</title>
+    <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
+    <script src="https://bundle.run/browserify-cipher@1.0.1"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1, h2 {
+            color: #333;
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .panel {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+            background-color: #f9f9f9;
+        }
+        .feed {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            background-color: white;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: #e9f7fe;
+            border-radius: 5px;
+            word-wrap: break-word;
+        }
+        .message-meta {
+            font-size: 0.8em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        input[type=text], textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+            margin-top: 6px;
+            margin-bottom: 16px;
+            resize: vertical;
+        }
+        #status {
+            color: #4CAF50;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 10px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            background-color: #eee;
+            border: 1px solid #ddd;
+            border-bottom: none;
+            border-radius: 4px 4px 0 0;
+            margin-right: 5px;
+        }
+        .tab.active {
+            background-color: #f9f9f9;
+            border-bottom: 1px solid #f9f9f9;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <h1>Nostr Demo Client</h1>
+    
+    <div class="container">
+        <div class="panel" id="keySection">
+            <h2>Key Management</h2>
+            <button id="generateKeysBtn">Generate New Keys</button>
+            <p>Or input existing keys:</p>
+            <label for="privateKeyInput">Private Key (hex):</label>
+            <input type="text" id="privateKeyInput" placeholder="Enter your private key here">
+            
+            <div id="keyInfo" style="display: none;">
+                <h3>Your Keys:</h3>
+                <p><strong>Public Key (hex):</strong> <span id="publicKeyDisplay"></span></p>
+                <p><strong>Private Key (hex):</strong> <span id="privateKeyDisplay"></span></p>
+                <button id="copyPublicKeyBtn">Copy Public Key</button>
+            </div>
+        </div>
+
+        <div class="panel" id="relaySection">
+            <h2>Connect to Relay</h2>
+            <label for="relayInput">Relay URL:</label>
+            <input type="text" id="relayInput" value="wss://relay.damus.io" placeholder="wss://relay.example.com">
+            <button id="connectBtn">Connect</button>
+            <p id="status">Not connected</p>
+        </div>
+
+        <div class="panel" id="publishSection">
+            <div class="tabs">
+                <div class="tab active" data-tab="profile">Profile (Kind 0)</div>
+                <div class="tab" data-tab="note">Note (Kind 1)</div>
+                <div class="tab" data-tab="dm">Direct Message (Kind 4)</div>
+            </div>
+
+            <div class="tab-content active" id="profile">
+                <h3>Update Profile (Kind 0)</h3>
+                <label for="profileName">Name:</label>
+                <input type="text" id="profileName" placeholder="Your name">
+                
+                <label for="profileAbout">About:</label>
+                <textarea id="profileAbout" rows="3" placeholder="Write something about yourself"></textarea>
+                
+                <button id="publishProfileBtn">Publish Profile</button>
+            </div>
+
+            <div class="tab-content" id="note">
+                <h3>Publish Note (Kind 1)</h3>
+                <label for="noteContent">Content:</label>
+                <textarea id="noteContent" rows="3" placeholder="What's on your mind?"></textarea>
+                
+                <button id="publishNoteBtn">Publish Note</button>
+            </div>
+
+            <div class="tab-content" id="dm">
+                <h3>Send Encrypted Message (Kind 4)</h3>
+                <label for="dmRecipient">Recipient Public Key (hex):</label>
+                <input type="text" id="dmRecipient" placeholder="Enter recipient's public key">
+                
+                <label for="dmContent">Message:</label>
+                <textarea id="dmContent" rows="3" placeholder="Type your private message"></textarea>
+                
+                <button id="sendDmBtn">Send Encrypted Message</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Message Feed</h2>
+            <div class="feed" id="messageFeed"></div>
+        </div>
+    </div>
+
+    <script>
+        // Utils
+        const hexToBytes = hex => Uint8Array.from(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const bytesToHex = bytes => bytes.reduce((str, byte) => str + byte.toString(16).padStart(2, "0"), "");
+        const { getSharedSecret, schnorr, utils } = nobleSecp256k1;
+        const sha256 = nobleSecp256k1.utils.sha256;
+
+        // Global variables
+        let privKey = "";
+        let pubKey = "";
+        let socket = null;
+        let isConnected = false;
+
+        // DOM elements
+        const generateKeysBtn = document.getElementById('generateKeysBtn');
+        const privateKeyInput = document.getElementById('privateKeyInput');
+        const publicKeyDisplay = document.getElementById('publicKeyDisplay');
+        const privateKeyDisplay = document.getElementById('privateKeyDisplay');
+        const keyInfo = document.getElementById('keyInfo');
+        const copyPublicKeyBtn = document.getElementById('copyPublicKeyBtn');
+        const relayInput = document.getElementById('relayInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const status = document.getElementById('status');
+        const profileName = document.getElementById('profileName');
+        const profileAbout = document.getElementById('profileAbout');
+        const publishProfileBtn = document.getElementById('publishProfileBtn');
+        const noteContent = document.getElementById('noteContent');
+        const publishNoteBtn = document.getElementById('publishNoteBtn');
+        const dmRecipient = document.getElementById('dmRecipient');
+        const dmContent = document.getElementById('dmContent');
+        const sendDmBtn = document.getElementById('sendDmBtn');
+        const messageFeed = document.getElementById('messageFeed');
+        const tabs = document.querySelectorAll('.tab');
+        
+        // Initialize tabs
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                tabs.forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                
+                document.querySelectorAll('.tab-content').forEach(content => {
+                    content.classList.remove('active');
+                });
+                
+                document.getElementById(tab.dataset.tab).classList.add('active');
+            });
+        });
+
+        // Key management
+        generateKeysBtn.addEventListener('click', () => {
+            generateKeys();
+        });
+
+        privateKeyInput.addEventListener('input', function() {
+            if (this.value.length === 64) {
+                try {
+                    privKey = this.value;
+                    pubKey = nobleSecp256k1.getPublicKey(privKey, true).substring(2);
+                    displayKeys();
+                } catch (e) {
+                    alert("Invalid private key format");
+                }
+            }
+        });
+
+        copyPublicKeyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(pubKey)
+                .then(() => {
+                    alert("Public key copied to clipboard!");
+                })
+                .catch(err => {
+                    console.error('Error copying text: ', err);
+                });
+        });
+
+        function generateKeys() {
+            privKey = bytesToHex(nobleSecp256k1.utils.randomPrivateKey());
+            pubKey = nobleSecp256k1.getPublicKey(privKey, true).substring(2);
+            displayKeys();
+        }
+
+        function displayKeys() {
+            publicKeyDisplay.textContent = pubKey;
+            privateKeyDisplay.textContent = privKey;
+            keyInfo.style.display = 'block';
+            
+            // Also fill in self as the default DM recipient
+            dmRecipient.value = pubKey;
+        }
+
+        // Relay connection
+        connectBtn.addEventListener('click', () => {
+            if (!pubKey) {
+                alert("Please generate or input keys first!");
+                return;
+            }
+            
+            const relay = relayInput.value;
+            if (!relay.startsWith('wss://')) {
+                alert("Relay URL should start with wss://");
+                return;
+            }
+            
+            connectToRelay(relay);
+        });
+
+        function connectToRelay(relay) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.close();
+            }
+            
+            try {
+                socket = new WebSocket(relay);
+                
+                socket.addEventListener('open', async function(e) {
+                    console.log("Connected to " + relay);
+                    status.textContent = "Connected to " + relay;
+                    isConnected = true;
+                    
+                    // Subscribe to our own events
+                    const subId = bytesToHex(nobleSecp256k1.utils.randomPrivateKey()).substring(0, 16);
+                    const filter = { "authors": [pubKey] };
+                    const subscription = ["REQ", subId, filter];
+                    socket.send(JSON.stringify(subscription));
+                    
+                    addToFeed({
+                        type: "system",
+                        content: `Connected to ${relay} and subscribed to events`
+                    });
+                });
+                
+                socket.addEventListener('message', async function(message) {
+                    console.log('[Client] Received message from relay:', message.data);
+                    const [type, subId, event] = JSON.parse(message.data);
+                    
+                    if (!event || event === true) return;
+                    
+                    let content = event.content;
+                    const kind = event.kind;
+                    
+                    // Decrypt if it's a DM
+                    if (kind === 4) {
+                        try {
+                            content = await decrypt(privKey, event.pubkey, content);
+                        } catch (e) {
+                            console.error('Decryption error:', e);
+                            content = "[Encrypted message - cannot decrypt]";
+                        }
+                    }
+                    
+                    // Parse and display content for Kind 0 (metadata)
+                    if (kind === 0) {
+                        try {
+                            const metadata = JSON.parse(content);
+                            content = `Profile Update - Name: ${metadata.name || 'N/A'}, About: ${metadata.about || 'N/A'}`;
+                        } catch (e) {
+                            console.error('Error parsing metadata:', e);
+                        }
+                    }
+                    
+                    addToFeed({
+                        type: kind === 0 ? "profile" : kind === 1 ? "note" : "dm",
+                        pubkey: event.pubkey,
+                        time: new Date(event.created_at * 1000).toLocaleString(),
+                        content: content
+                    });
+                });
+                
+                socket.addEventListener('close', function(e) {
+                    console.log('Connection closed');
+                    status.textContent = "Disconnected";
+                    status.style.color = "red";
+                    isConnected = false;
+                    
+                    addToFeed({
+                        type: "system",
+                        content: "Disconnected from relay"
+                    });
+                });
+                
+                socket.addEventListener('error', function(e) {
+                    console.error('WebSocket error:', e);
+                    status.textContent = "Error connecting";
+                    status.style.color = "red";
+                    isConnected = false;
+                    
+                    addToFeed({
+                        type: "system",
+                        content: "Error connecting to relay"
+                    });
+                });
+            } catch (e) {
+                console.error('Connection error:', e);
+                status.textContent = "Error: " + e.message;
+                status.style.color = "red";
+            }
+        }
+
+        // Publishing events
+        publishProfileBtn.addEventListener('click', async () => {
+            if (!checkConnection()) return;
+            
+            const name = profileName.value.trim();
+            const about = profileAbout.value.trim();
+            
+            if (!name && !about) {
+                alert("Please enter a name or about text");
+                return;
+            }
+            
+            const content = JSON.stringify({
+                name: name,
+                about: about
+            });
+            
+            const event = {
+                "content": content,
+                "created_at": Math.floor(Date.now() / 1000),
+                "kind": 0,
+                "tags": [],
+                "pubkey": pubKey,
+            };
+            
+            const signedEvent = await getSignedEvent(event, privKey);
+            socket.send(JSON.stringify(["EVENT", signedEvent]));
+            
+            addToFeed({
+                type: "system",
+                content: "Profile update sent to relay"
+            });
+        });
+        
+        publishNoteBtn.addEventListener('click', async () => {
+            if (!checkConnection()) return;
+            
+            const content = noteContent.value.trim();
+            
+            if (!content) {
+                alert("Please enter some content for your note");
+                return;
+            }
+            
+            const event = {
+                "content": content,
+                "created_at": Math.floor(Date.now() / 1000),
+                "kind": 1,
+                "tags": [],
+                "pubkey": pubKey,
+            };
+            
+            const signedEvent = await getSignedEvent(event, privKey);
+            socket.send(JSON.stringify(["EVENT", signedEvent]));
+            
+            noteContent.value = "";
+            
+            addToFeed({
+                type: "system",
+                content: "Note sent to relay"
+            });
+        });
+        
+        sendDmBtn.addEventListener('click', async () => {
+            if (!checkConnection()) return;
+            
+            const recipient = dmRecipient.value.trim();
+            const content = dmContent.value.trim();
+            
+            if (!recipient) {
+                alert("Please enter a recipient public key");
+                return;
+            }
+            
+            if (!content) {
+                alert("Please enter a message");
+                return;
+            }
+            
+            const encrypted = encrypt(privKey, recipient, content);
+            
+            const event = {
+                "content": encrypted,
+                "created_at": Math.floor(Date.now() / 1000),
+                "kind": 4,
+                "tags": [["p", recipient]],
+                "pubkey": pubKey,
+            };
+            
+            const signedEvent = await getSignedEvent(event, privKey);
+            socket.send(JSON.stringify(["EVENT", signedEvent]));
+            
+            dmContent.value = "";
+            
+            addToFeed({
+                type: "system",
+                content: "Encrypted message sent to relay"
+            });
+        });
+
+        function checkConnection() {
+            if (!isConnected) {
+                alert("Please connect to a relay first!");
+                return false;
+            }
+            
+            if (!pubKey) {
+                alert("Please generate or input keys first!");
+                return false;
+            }
+            
+            return true;
+        }
+
+        function addToFeed(message) {
+            const messageElement = document.createElement('div');
+            messageElement.className = 'message';
+            
+            if (message.type === "system") {
+                messageElement.style.backgroundColor = "#f0f0f0";
+                messageElement.innerHTML = `<div class="message-meta">SYSTEM - ${new Date().toLocaleString()}</div>
+                                          <div>${message.content}</div>`;
+            } else {
+                let typeLabel = "";
+                let bgColor = "";
+                
+                switch (message.type) {
+                    case "profile":
+                        typeLabel = "PROFILE UPDATE";
+                        bgColor = "#e6f7ff";
+                        break;
+                    case "note":
+                        typeLabel = "NOTE";
+                        bgColor = "#e9f7fe";
+                        break;
+                    case "dm":
+                        typeLabel = "DIRECT MESSAGE";
+                        bgColor = "#ffebcd";
+                        break;
+                }
+                
+                messageElement.style.backgroundColor = bgColor;
+                
+                // Truncate pubkey for display
+                const shortPubkey = message.pubkey.substring(0, 8) + "..." + message.pubkey.substring(message.pubkey.length - 8);
+                
+                messageElement.innerHTML = `<div class="message-meta">${typeLabel} from ${shortPubkey} - ${message.time}</div>
+                                          <div>${message.content}</div>`;
+            }
+            
+            messageFeed.prepend(messageElement);
+        }
+
+        // Event signing function
+        async function getSignedEvent(event, privateKey) {
+            const eventData = JSON.stringify([
+                0,                    // Reserved for future use
+                event['pubkey'],      // The sender's public key
+                event['created_at'],  // Unix timestamp
+                event['kind'],        // Message "kind" or type
+                event['tags'],        // Tags identify replies/recipients
+                event['content']      // Your note contents
+            ]);
+            event.id = bytesToHex(await sha256((new TextEncoder().encode(eventData))));
+            event.sig = await schnorr.sign(event.id, privateKey);
+            return event;
+        }
+
+        // Encryption/decryption functions
+        function base64ToHex(str) {
+            const raw = atob(str);
+            let result = '';
+            for (let i = 0; i < raw.length; i++) {
+                const hex = raw.charCodeAt(i).toString(16);
+                result += (hex.length === 2 ? hex : '0' + hex);
+            }
+            return result;
+        }
+
+        function encrypt(privkey, pubkey, text) {
+            const key = nobleSecp256k1.getSharedSecret(privkey, '02' + pubkey, true).substring(2);
+            const iv = window.crypto.getRandomValues(new Uint8Array(16));
+            const cipher = browserifyCipher.createCipheriv('aes-256-cbc', hexToBytes(key), iv);
+            let encryptedMessage = cipher.update(text, "utf8", "base64");
+            encryptedMessage = encryptedMessage + cipher.final("base64");
+            const uint8View = new Uint8Array(iv.buffer);
+            return encryptedMessage + "?iv=" + btoa(String.fromCharCode.apply(null, uint8View));
+        }
+
+        function decrypt(privkey, pubkey, ciphertext) {
+            const [emsg, iv] = ciphertext.split("?iv=");
+            const key = nobleSecp256k1.getSharedSecret(privkey, '02' + pubkey, true).substring(2);
+            const decipher = browserifyCipher.createDecipheriv(
+                'aes-256-cbc',
+                hexToBytes(key),
+                hexToBytes(base64ToHex(iv))
+            );
+            let decryptedMessage = decipher.update(emsg, "base64", "utf8");
+            decryptedMessage = decryptedMessage + decipher.final("utf8");
+            return decryptedMessage;
+        }
+
+        // Initialize with default keys on page load
+        generateKeys();
+    </script>
+</body>
+</html>
